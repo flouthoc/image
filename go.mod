@@ -1,4 +1,4 @@
-module github.com/containers/image/v5
+module github.com/flouthoc/image
 
 go 1.13
 
