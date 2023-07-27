@@ -94,23 +94,24 @@ func validateCompressionVariantExists(input []OptionCompressionVariant) error {
 }
 
 // prepareInstanceCopies prepares a list of instances which needs to copied to the manifest list.
-func prepareInstanceCopies(list internalManifest.List, instanceDigests []digest.Digest, options *Options) ([]instanceCopy, error) {
+func prepareInstanceCopies(list internalManifest.List, instanceDigests []digest.Digest, options *Options) ([]instanceCopy, bool, error) {
 	res := []instanceCopy{}
+	ifCloneOp := false
 	if options.ImageListSelection == CopySpecificImages && len(options.EnsureCompressionVariantsExist) > 0 {
 		// List can already contain compressed instance for a compression selected in `EnsureCompressionVariantsExist`
 		// It’s unclear what it means when `CopySpecificImages` includes an instance in options.Instances,
 		// EnsureCompressionVariantsExist asks for an instance with some compression,
 		// an instance with that compression already exists, but is not included in options.Instances.
 		// We might define the semantics and implement this in the future.
-		return res, fmt.Errorf("EnsureCompressionVariantsExist is not implemented for CopySpecificImages")
+		return res, ifCloneOp, fmt.Errorf("EnsureCompressionVariantsExist is not implemented for CopySpecificImages")
 	}
 	err := validateCompressionVariantExists(options.EnsureCompressionVariantsExist)
 	if err != nil {
-		return res, err
+		return res, ifCloneOp, err
 	}
 	compressionsByPlatform, err := platformCompressionMap(list, instanceDigests)
 	if err != nil {
-		return nil, err
+		return nil, ifCloneOp, err
 	}
 	for i, instanceDigest := range instanceDigests {
 		if options.ImageListSelection == CopySpecificImages &&
@@ -120,7 +121,7 @@ func prepareInstanceCopies(list internalManifest.List, instanceDigests []digest.
 		}
 		instanceDetails, err := list.Instance(instanceDigest)
 		if err != nil {
-			return res, fmt.Errorf("getting details for instance %s: %w", instanceDigest, err)
+			return res, ifCloneOp, fmt.Errorf("getting details for instance %s: %w", instanceDigest, err)
 		}
 		res = append(res, instanceCopy{
 			op:           instanceCopyCopy,
@@ -130,6 +131,7 @@ func prepareInstanceCopies(list internalManifest.List, instanceDigests []digest.
 		compressionList := compressionsByPlatform[platform]
 		for _, compressionVariant := range options.EnsureCompressionVariantsExist {
 			if !compressionList.Contains(compressionVariant.Algorithm.Name()) {
+				ifCloneOp = true
 				res = append(res, instanceCopy{
 					op:                      instanceCopyClone,
 					sourceDigest:            instanceDigest,
@@ -142,7 +144,7 @@ func prepareInstanceCopies(list internalManifest.List, instanceDigests []digest.
 			}
 		}
 	}
-	return res, nil
+	return res, ifCloneOp, nil
 }
 
 // copyMultipleImages copies some or all of an image list's instances, using
@@ -217,7 +219,7 @@ func (c *copier) copyMultipleImages(ctx context.Context) (copiedManifest []byte,
 	// Copy each image, or just the ones we want to copy, in turn.
 	instanceDigests := updatedList.Instances()
 	instanceEdits := []internalManifest.ListEdit{}
-	instanceCopyList, err := prepareInstanceCopies(updatedList, instanceDigests, c.options)
+	instanceCopyList, ifCloneOp, err := prepareInstanceCopies(updatedList, instanceDigests, c.options)
 	if err != nil {
 		return nil, fmt.Errorf("preparing instances for copy: %w", err)
 	}
@@ -230,7 +232,13 @@ func (c *copier) copyMultipleImages(ctx context.Context) (copiedManifest []byte,
 			logrus.Debugf("Copying instance %s (%d/%d)", instance.sourceDigest, i+1, len(instanceCopyList))
 			c.Printf("Copying image %s (%d/%d)\n", instance.sourceDigest, i+1, len(instanceCopyList))
 			unparsedInstance := image.UnparsedInstance(c.rawSource, &instanceCopyList[i].sourceDigest)
-			updated, err := c.copySingleImage(ctx, unparsedInstance, &instanceCopyList[i].sourceDigest, copySingleImageOptions{requireCompressionFormatMatch: false})
+			copySingleOpts := copySingleImageOptions{requireCompressionFormatMatch: ifCloneOp}
+			if ifCloneOp {
+				if c.options.DestinationCtx == nil || c.options.DestinationCtx.CompressionFormat == nil {
+					copySingleOpts.compressionFormat = &compression.Gzip
+				}
+			}
+			updated, err := c.copySingleImage(ctx, unparsedInstance, &instanceCopyList[i].sourceDigest, copySingleOpts)
 			if err != nil {
 				return nil, fmt.Errorf("copying image %d/%d from manifest list: %w", i+1, len(instanceCopyList), err)
 			}
